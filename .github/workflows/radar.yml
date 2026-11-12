@@ -2,45 +2,20 @@
 name: BingX AI Radar
 
 on:
-  schedule:
-    - cron: "*/15 * * * *"
   workflow_dispatch:
+
+  schedule:
+    - cron: "7,22,37,52 * * * *"
 
 permissions:
   contents: write
 
-concurrency:
-  group: bingx-radar
-  cancel-in-progress: false
-
 jobs:
-  radar:
+  test:
     runs-on: ubuntu-latest
 
     steps:
-      - name: 下載程式
-        uses: actions/checkout@v4
-
-      - name: 安裝 Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: 安裝工具
-        run: pip install -r requirements.txt
-
-      - name: 執行 BingX 雷達
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python main.py
-
-      - name: 儲存持倉紀錄
+      - name: 確認工作流程正常
         run: |
-          git config user.name "BingX Radar"
-          git config user.email "radar@users.noreply.github.com"
-          git add state.json
-          git diff --cached --quiet || (
-            git commit -m "Update radar state" &&
-            git push
-          )
+          echo "BingX AI Radar 工作流程啟動成功"
+          echo "目前時間：$(date -u)"
