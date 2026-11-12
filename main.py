@@ -21,7 +21,7 @@ from datetime import datetime, timezone, timedelta
 最低幣價 = 0.1
 最高幣價 = 0.9999
 
-每次掃描數量 = 10
+每次掃描數量 = 5
 掃描間隔 = 900
 
 排除幣種 = {
@@ -39,7 +39,7 @@ TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
 紀錄檔 = "state.json"
 
 請求重試次數 = 3
-請求間隔 = 1.2
+請求間隔 = 2.0
 
 logging.basicConfig(
     level=logging.INFO,
@@ -64,20 +64,28 @@ def 現在時間():
     )
 
 
+
 def 取得資料(path, params=None):
 
     url = 網址 + path
 
     最後錯誤 = None
 
-    for attempt in range(請求重試次數):
+    for attempt in range(5):
 
         try:
 
             response = session.get(
                 url,
                 params=params or {},
-                timeout=20
+                timeout=30
+            )
+
+            print(
+                "API請求：",
+                path,
+                "HTTP：",
+                response.status_code
             )
 
             response.raise_for_status()
@@ -85,17 +93,23 @@ def 取得資料(path, params=None):
             result = response.json()
 
             if not isinstance(result, dict):
-                raise ValueError("API回傳格式不是JSON物件")
+                raise ValueError(
+                    f"API格式錯誤：{str(result)[:300]}"
+                )
 
             code = result.get("code", 0)
+            msg = result.get("msg", "")
 
-            if str(code) not in ("0", "None"):
+            if str(code) != "0":
+
                 raise Exception(
-                    result.get("msg", "BingX API錯誤")
+                    f"BingX錯誤碼={code}，訊息={msg}"
                 )
 
             if "data" not in result:
-                raise ValueError("API缺少data欄位")
+                raise ValueError(
+                    f"API缺少data：{result}"
+                )
 
             return result["data"]
 
@@ -103,18 +117,16 @@ def 取得資料(path, params=None):
 
             最後錯誤 = e
 
-            logging.warning(
-                "API請求失敗 %s (%s/%s): %s",
-                path,
-                attempt + 1,
-                請求重試次數,
-                str(e)
+            print(
+                f"API失敗 {attempt + 1}/5：",
+                repr(e)
             )
 
-            time.sleep(1.5 * (attempt + 1))
+            if attempt < 4:
+                time.sleep(3 * (attempt + 1))
 
     raise Exception(
-        f"API請求最終失敗：{path}：{最後錯誤}"
+        f"API最終失敗：{path}：{最後錯誤}"
     )
 
 
@@ -1040,12 +1052,19 @@ def main():
 
     import traceback
 
-    print("\n")
-    print("=" * 60)
-    print("幣種分析失敗：", symbol)
-    print("錯誤類型：", type(e).__name__)
-    print("錯誤內容：", repr(e))
-    print("完整錯誤位置：")
+    print(
+        f"\n❌ 幣種分析失敗：{symbol}"
+    )
+
+    print(
+        "錯誤類型：",
+        type(e).__name__
+    )
+
+    print(
+        "錯誤內容：",
+        repr(e)
+    )
 
     traceback.print_exc()
 
