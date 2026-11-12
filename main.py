@@ -37,6 +37,9 @@ TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
 
 紀錄檔 = "state.json"
+print("目前執行檔：", os.path.abspath(__file__))
+print("目前掃描數量：", 每次掃描數量)
+print("目前請求間隔：", 請求間隔)
 
 請求重試次數 = 3
 請求間隔 = 2.0
@@ -1049,12 +1052,12 @@ def main():
             results.append(result)
 
         except Exception as e:
-
     import traceback
 
-    print(
-        f"\n❌ 幣種分析失敗：{symbol}"
-    )
+    print("幣種分析失敗：", symbol)
+    print("錯誤類型：", type(e).__name__)
+    print("錯誤內容：", repr(e))
+    traceback.print_exc()
 
     print(
         "錯誤類型：",
