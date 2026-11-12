@@ -1038,10 +1038,19 @@ def main():
 
         except Exception as e:
 
-            logging.exception(
-                "幣種分析失敗：%s",
-                symbol
-            )
+    import traceback
+
+    print("\n")
+    print("=" * 60)
+    print("幣種分析失敗：", symbol)
+    print("錯誤類型：", type(e).__name__)
+    print("錯誤內容：", repr(e))
+    print("完整錯誤位置：")
+
+    traceback.print_exc()
+
+    print("=" * 60)
+    print("\n")
 
         time.sleep(請求間隔)
 
