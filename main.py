@@ -6,11 +6,19 @@ import requests
 
 from datetime import datetime, timezone, timedelta
 
+# ==========================================
+# 程式版本確認
+# ==========================================
+
+print("========== 新版程式測試 ==========")
+print("執行檔位置：", os.path.abspath(__file__))
+print("目前時間：", datetime.now())
+print("=================================")
+
 
 # ==========================================
 # 1. 專屬設定
 # ==========================================
-
 本金 = 100.0
 單筆風險 = 1.0
 
@@ -37,12 +45,13 @@ TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
 
 紀錄檔 = "state.json"
+
+請求重試次數 = 3
+請求間隔 = 2.0
 print("目前執行檔：", os.path.abspath(__file__))
 print("目前掃描數量：", 每次掃描數量)
 print("目前請求間隔：", 請求間隔)
 
-請求重試次數 = 3
-請求間隔 = 2.0
 
 logging.basicConfig(
     level=logging.INFO,
@@ -980,6 +989,10 @@ def main():
     try:
 
         candidates = 掃描幣種()
+        print("實際取得幣種數量：", len(candidates))
+print("實際取得幣種：", [
+    x.get("symbol") for x in candidates
+])
 
     except Exception as e:
 
@@ -1052,12 +1065,16 @@ def main():
             results.append(result)
 
         except Exception as e:
+
     import traceback
 
     print("幣種分析失敗：", symbol)
     print("錯誤類型：", type(e).__name__)
     print("錯誤內容：", repr(e))
+
     traceback.print_exc()
+
+    print("=" * 60)
 
     print(
         "錯誤類型：",
