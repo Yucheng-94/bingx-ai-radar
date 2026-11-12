@@ -1,15 +1,19 @@
 import os
 import time
 import json
+import logging
 import requests
+
 from datetime import datetime, timezone, timedelta
 
-# ==================================
-# 1. 你的專屬設定
-# ==================================
+
+# ==========================================
+# 1. 專屬設定
+# ==========================================
 
 本金 = 100.0
 單筆風險 = 1.0
+
 預設槓桿 = 2
 最高槓桿 = 5
 最高保證金 = 20.0
@@ -34,182 +38,365 @@ TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
 
 紀錄檔 = "state.json"
 
+請求重試次數 = 3
+請求間隔 = 1.2
 
-# ==================================
-# 2. 基本工具
-# ==================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
+
+
+# ==========================================
+# 2. HTTP Session
+# ==========================================
+
+session = requests.Session()
+
+session.headers.update({
+    "User-Agent": "BingX-Market-Radar/2.0"
+})
+
 
 def 現在時間():
-    return datetime.now(時區).strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now(時區).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
 
 
 def 取得資料(path, params=None):
-    r = requests.get(
-        網址 + path,
-        params=params or {},
-        timeout=20
+
+    url = 網址 + path
+
+    最後錯誤 = None
+
+    for attempt in range(請求重試次數):
+
+        try:
+
+            response = session.get(
+                url,
+                params=params or {},
+                timeout=20
+            )
+
+            response.raise_for_status()
+
+            result = response.json()
+
+            if not isinstance(result, dict):
+                raise ValueError("API回傳格式不是JSON物件")
+
+            code = result.get("code", 0)
+
+            if str(code) not in ("0", "None"):
+                raise Exception(
+                    result.get("msg", "BingX API錯誤")
+                )
+
+            if "data" not in result:
+                raise ValueError("API缺少data欄位")
+
+            return result["data"]
+
+        except Exception as e:
+
+            最後錯誤 = e
+
+            logging.warning(
+                "API請求失敗 %s (%s/%s): %s",
+                path,
+                attempt + 1,
+                請求重試次數,
+                str(e)
+            )
+
+            time.sleep(1.5 * (attempt + 1))
+
+    raise Exception(
+        f"API請求最終失敗：{path}：{最後錯誤}"
     )
-    r.raise_for_status()
 
-    data = r.json()
 
-    if data.get("code", 0) != 0:
-        raise Exception(data.get("msg", "BingX資料錯誤"))
-
-    return data.get("data")
-
+# ==========================================
+# 3. Telegram通知
+# ==========================================
 
 def 傳送通知(message):
+
     if not TG_TOKEN or not TG_CHAT:
+
         print("尚未設定Telegram")
         print(message)
         return
 
-    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-
-    r = requests.post(
-        url,
-        json={
-            "chat_id": TG_CHAT,
-            "text": message
-        },
-        timeout=20
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{TG_TOKEN}/sendMessage"
     )
-    r.raise_for_status()
 
+    分段長度 = 3500
+
+    chunks = [
+        message[i:i + 分段長度]
+        for i in range(0, len(message), 分段長度)
+    ]
+
+    for chunk in chunks:
+
+        try:
+
+            response = session.post(
+                url,
+                json={
+                    "chat_id": TG_CHAT,
+                    "text": chunk
+                },
+                timeout=20
+            )
+
+            response.raise_for_status()
+
+            result = response.json()
+
+            if not result.get("ok"):
+                raise Exception(str(result))
+
+        except Exception as e:
+
+            logging.error(
+                "Telegram傳送失敗：%s",
+                str(e)
+            )
+
+
+# ==========================================
+# 4. 狀態紀錄
+# ==========================================
 
 def 讀取紀錄():
+
     try:
-        with open(紀錄檔, "r") as f:
-            return json.load(f)
+
+        with open(
+            紀錄檔,
+            "r",
+            encoding="utf-8"
+        ) as f:
+
+            data = json.load(f)
+
+            return data if isinstance(data, dict) else {}
+
     except Exception:
+
         return {}
 
 
 def 儲存紀錄(data):
-    with open(紀錄檔, "w") as f:
-        json.dump(data, f)
+
+    temp_file = 紀錄檔 + ".tmp"
+
+    with open(
+        temp_file,
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        json.dump(
+            data,
+            f,
+            ensure_ascii=False,
+            indent=2
+        )
+
+    os.replace(temp_file, 紀錄檔)
 
 
-# ==================================
-# 3. EMA及RSI
-# ==================================
+# ==========================================
+# 5. 技術指標
+# ==========================================
 
 def 計算EMA(values, period):
+
+    if not values:
+        return []
+
     alpha = 2 / (period + 1)
-    result = [values[0]]
+
+    result = [float(values[0])]
 
     for value in values[1:]:
+
         result.append(
-            alpha * value +
-            (1 - alpha) * result[-1]
+            alpha * float(value)
+            + (1 - alpha) * result[-1]
         )
 
     return result
 
 
 def 計算RSI(values, period=14):
+
+    if len(values) < period + 1:
+        raise ValueError("RSI資料不足")
+
     changes = [
         values[i] - values[i - 1]
         for i in range(1, len(values))
     ]
 
-    gains = [max(x, 0) for x in changes]
-    losses = [max(-x, 0) for x in changes]
+    gains = [
+        max(x, 0)
+        for x in changes
+    ]
 
-    avg_gain = sum(gains[-period:]) / period
-    avg_loss = sum(losses[-period:]) / period
+    losses = [
+        max(-x, 0)
+        for x in changes
+    ]
+
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+
+    for i in range(period, len(changes)):
+
+        avg_gain = (
+            avg_gain * (period - 1)
+            + gains[i]
+        ) / period
+
+        avg_loss = (
+            avg_loss * (period - 1)
+            + losses[i]
+        ) / period
 
     if avg_loss == 0:
+
+        if avg_gain == 0:
+            return 50.0
+
         return 100.0
 
     rs = avg_gain / avg_loss
 
-    return 100 - (100 / (1 + rs))
+    return 100 - (100 / (1 + rs)) # ==========================================
+# 6. K線資料解析
+# ==========================================
 
+def 解析K線(data):
 
-# ==================================
-# 4. 取得K線
-# ==================================
+    opens = []
+    highs = []
+    lows = []
+    closes = []
+    volumes = []
+    buys = []
+
+    for x in data:
+
+        if isinstance(x, dict):
+
+            o = float(x["open"])
+            h = float(x["high"])
+            l = float(x["low"])
+            c = float(x["close"])
+            v = float(x["volume"])
+
+            b = float(
+                x.get("takerBuyBaseVolume", v / 2)
+            )
+
+        elif isinstance(x, (list, tuple)):
+
+            if len(x) < 6:
+                continue
+
+            o = float(x[1])
+            h = float(x[2])
+            l = float(x[3])
+            c = float(x[4])
+            v = float(x[5])
+
+            b = (
+                float(x[9])
+                if len(x) > 9
+                else v / 2
+            )
+
+        else:
+            continue
+
+        if not all(
+            map(
+                lambda n: n >= 0,
+                [o, h, l, c, v, b]
+            )
+        ):
+            continue
+
+        if h < l or c <= 0:
+            continue
+
+        opens.append(o)
+        highs.append(h)
+        lows.append(l)
+        closes.append(c)
+        volumes.append(v)
+        buys.append(b)
+
+    if len(closes) < 30:
+        return None
+
+    return {
+        "open": opens,
+        "high": highs,
+        "low": lows,
+        "close": closes,
+        "volume": volumes,
+        "buy": buys
+    }
+
 
 def 取得K線(symbol, interval):
+
     data = 取得資料(
         "/openApi/swap/v3/quote/klines",
         {
             "symbol": symbol,
             "interval": interval,
-            "limit": 80
+            "limit": 100
         }
     )
 
-    if not data or len(data) < 30:
+    if not data:
         return None
 
-    try:
-        opens = []
-        highs = []
-        lows = []
-        closes = []
-        volumes = []
-        buys = []
-
-        for x in data:
-
-            if isinstance(x, dict):
-                o = float(x["open"])
-                h = float(x["high"])
-                l = float(x["low"])
-                c = float(x["close"])
-                v = float(x["volume"])
-
-                # 沒有主動買入量時，使用成交量一半作為中性估值
-                b = float(
-                    x.get("takerBuyBaseVolume", v / 2)
-                )
-
-            else:
-                o = float(x[1])
-                h = float(x[2])
-                l = float(x[3])
-                c = float(x[4])
-                v = float(x[5])
-
-                b = (
-                    float(x[9])
-                    if len(x) > 9
-                    else v / 2
-                )
-
-            opens.append(o)
-            highs.append(h)
-            lows.append(l)
-            closes.append(c)
-            volumes.append(v)
-            buys.append(b)
-
-        return {
-            "open": opens,
-            "high": highs,
-            "low": lows,
-            "close": closes,
-            "volume": volumes,
-            "buy": buys
-        }
-
-    except Exception as e:
-        print(
-            "K線資料格式錯誤：",
-            symbol,
-            interval,
-            repr(e)
+    if isinstance(data, dict):
+        data = data.get(
+            "data",
+            data.get("list", [])
         )
-        raise
+
+    if not isinstance(data, list):
+        raise ValueError("K線回傳不是列表")
+
+    return 解析K線(data)
+
+
+# ==========================================
+# 7. K線技術分析
+# ==========================================
 
 def 分析K線(k):
+
     close = k["close"]
     high = k["high"]
     low = k["low"]
     volume = k["volume"]
+
+    if len(close) < 30:
+        raise ValueError("技術分析資料不足")
 
     ema7 = 計算EMA(close, 7)
     ema25 = 計算EMA(close, 25)
@@ -220,20 +407,37 @@ def 分析K線(k):
 
     成交倍數 = (
         volume[-1] / 成交平均
-        if 成交平均 > 0 else 1
+        if 成交平均 > 0
+        else 1
     )
 
-    atr = sum(
-        high[i] - low[i]
-        for i in range(len(high) - 14, len(high))
-    ) / 14
+    # ATR真實波幅
+    true_ranges = []
+
+    for i in range(1, len(close)):
+
+        tr = max(
+            high[i] - low[i],
+            abs(high[i] - close[i - 1]),
+            abs(low[i] - close[i - 1])
+        )
+
+        true_ranges.append(tr)
+
+    atr = sum(true_ranges[-14:]) / 14
 
     支撐 = min(low[-20:])
     壓力 = max(high[-20:])
 
     買盤比例 = (
         k["buy"][-1] / volume[-1]
-        if volume[-1] > 0 else 0.5
+        if volume[-1] > 0
+        else 0.5
+    )
+
+    買盤比例 = max(
+        0,
+        min(1, 買盤比例)
     )
 
     分數 = 0
@@ -251,14 +455,16 @@ def 分析K線(k):
     if rsi < 35:
         分數 += 1
 
-    if rsi > 70:
+    elif rsi > 70:
         分數 -= 1
 
-    if 成交倍數 > 1.5 and 買盤比例 > 0.55:
-        分數 += 1
+    if 成交倍數 > 1.5:
 
-    if 成交倍數 > 1.5 and 買盤比例 < 0.45:
-        分數 -= 1
+        if 買盤比例 > 0.55:
+            分數 += 1
+
+        elif 買盤比例 < 0.45:
+            分數 -= 1
 
     return {
         "分數": 分數,
@@ -273,20 +479,46 @@ def 分析K線(k):
     }
 
 
-# ==================================
-# 5. 主力動向觀察
-# ==================================
+# ==========================================
+# 8. 持倉量 OI
+# ==========================================
 
 def 取得持倉量(symbol):
+
     data = 取得資料(
         "/openApi/swap/v2/quote/openInterest",
-        {"symbol": symbol}
+        {
+            "symbol": symbol
+        }
     )
 
-    return float(data["openInterest"])
+    if isinstance(data, list):
 
+        if not data:
+            raise ValueError("OI資料為空")
+
+        data = data[0]
+
+    if not isinstance(data, dict):
+        raise ValueError("OI格式錯誤")
+
+    value = data.get(
+        "openInterest",
+        data.get("openInterestAmount")
+    )
+
+    if value is None:
+        raise ValueError("找不到OI欄位")
+
+    return float(value)
+
+
+# ==========================================
+# 9. 買賣盤深度
+# ==========================================
 
 def 取得買賣掛單(symbol):
+
     data = 取得資料(
         "/openApi/swap/v2/quote/depth",
         {
@@ -295,29 +527,52 @@ def 取得買賣掛單(symbol):
         }
     )
 
+    if not isinstance(data, dict):
+        raise ValueError("深度資料格式錯誤")
+
     bids = data.get("bids", [])
     asks = data.get("asks", [])
 
-    買單 = sum(
-        float(x[0]) * float(x[1])
-        for x in bids
-    )
+    def 計算掛單總額(items):
 
-    賣單 = sum(
-        float(x[0]) * float(x[1])
-        for x in asks
-    )
+        total = 0
+
+        for x in items:
+
+            if isinstance(x, dict):
+
+                price = float(x["price"])
+
+                amount = float(
+                    x.get(
+                        "quantity",
+                        x.get("qty", 0)
+                    )
+                )
+
+            else:
+
+                price = float(x[0])
+                amount = float(x[1])
+
+            total += price * amount
+
+        return total
+
+    買單 = 計算掛單總額(bids)
+    賣單 = 計算掛單總額(asks)
 
     total = 買單 + 賣單
 
-    比例 = 買單 / total if total > 0 else 0.5
+    if total <= 0:
+        return 0.5
 
-    return 比例
+    return 買單 / total
 
 
-# ==================================
-# 6. 計算建議下單金額
-# ==================================
+# ==========================================
+# 10. 風險管理
+# ==========================================
 
 def 計算下單(方向, 進場, 止損):
 
@@ -328,19 +583,31 @@ def 計算下單(方向, 進場, 止損):
 
     距離比例 = 距離 / 進場
 
-    # 以最多虧損1 USDT反推合約金額
-    合約金額 = 單筆風險 / 距離比例
+    if 距離比例 <= 0:
+        return None
 
-    # 先限制保證金
-    槓桿 = min(預設槓桿, 最高槓桿)
+    # 風險反推倉位
+    理論合約金額 = 單筆風險 / 距離比例
+
+    槓桿 = min(
+        預設槓桿,
+        最高槓桿
+    )
+
+    可用保證金 = min(
+        最高保證金,
+        本金
+    )
+
+    合約金額上限 = 可用保證金 * 槓桿
+
+    合約金額 = min(
+        理論合約金額,
+        合約金額上限
+    )
 
     保證金 = 合約金額 / 槓桿
 
-    if 保證金 > 最高保證金:
-        保證金 = 最高保證金
-        合約金額 = 保證金 * 槓桿
-
-    # 計算實際價格變動造成的預估虧損
     預估虧損 = 合約金額 * 距離比例
 
     return {
@@ -352,65 +619,137 @@ def 計算下單(方向, 進場, 止損):
     }
 
 
-# ==================================
-# 7. 綜合判斷
-# ==================================
+# ==========================================
+# 11. 綜合分析
+# ==========================================
 
-def 分析幣種(symbol, price, k15, k1h, k4h, state):
+def 分析幣種(
+    symbol,
+    price,
+    k15,
+    k1h,
+    k4h,
+    state
+):
 
     a15 = 分析K線(k15)
     a1h = 分析K線(k1h)
     a4h = 分析K線(k4h)
 
-    oi = 取得持倉量(symbol)
-    book = 取得買賣掛單(symbol)
+    oi = None
+    book = 0.5
 
-    old = state.get(symbol, {}).get("oi")
+    try:
+
+        oi = 取得持倉量(symbol)
+
+    except Exception as e:
+
+        logging.warning(
+            "%s OI取得失敗：%s",
+            symbol,
+            str(e)
+        )
+
+    try:
+
+        book = 取得買賣掛單(symbol)
+
+    except Exception as e:
+
+        logging.warning(
+            "%s 深度取得失敗：%s",
+            symbol,
+            str(e)
+        )
+
+    old = state.get(
+        symbol,
+        {}
+    ).get("oi")
 
     oi_change = 0
 
-    if old and float(old) > 0:
-        oi_change = (oi / float(old) - 1) * 100
+    if (
+        oi is not None
+        and old is not None
+        and float(old) > 0
+    ):
 
-    state[symbol] = {"oi": oi}
+        oi_change = (
+            oi / float(old) - 1
+        ) * 100
+
+    if oi is not None:
+
+        state[symbol] = {
+            "oi": oi,
+            "time": 現在時間()
+        }
 
     分數 = (
-        a15["分數"] * 1.5 +
-        a1h["分數"] * 1.5 +
-        a4h["分數"]
+        a15["分數"] * 1.5
+        + a1h["分數"] * 1.5
+        + a4h["分數"]
     )
 
-    if oi_change > 1 and book > 0.55:
-        分數 += 1
+    if oi is not None:
 
-    elif oi_change > 1 and book < 0.45:
-        分數 -= 1
+        if oi_change > 1 and book > 0.55:
+            分數 += 1
+
+        elif oi_change > 1 and book < 0.45:
+            分數 -= 1
 
     if 分數 >= 3:
+
         方向 = "偏向上漲"
         動作 = "觀察做多"
+
         進場 = max(
             a15["支撐"],
             price - a15["ATR"] * 0.3
         )
-        止損 = 進場 - a15["ATR"] * 1.5
-        止盈1 = 進場 + (進場 - 止損) * 2
-        止盈2 = 進場 + (進場 - 止損) * 3
+
+        止損 = (
+            進場 - a15["ATR"] * 1.5
+        )
+
+        止盈1 = (
+            進場 + (進場 - 止損) * 2
+        )
+
+        止盈2 = (
+            進場 + (進場 - 止損) * 3
+        )
 
     elif 分數 <= -3:
+
         方向 = "偏向下跌"
         動作 = "觀察做空"
+
         進場 = min(
             a15["壓力"],
             price + a15["ATR"] * 0.3
         )
-        止損 = 進場 + a15["ATR"] * 1.5
-        止盈1 = 進場 - (止損 - 進場) * 2
-        止盈2 = 進場 - (止損 - 進場) * 3
+
+        止損 = (
+            進場 + a15["ATR"] * 1.5
+        )
+
+        止盈1 = (
+            進場 - (止損 - 進場) * 2
+        )
+
+        止盈2 = (
+            進場 - (止損 - 進場) * 3
+        )
 
     else:
+
         方向 = "目前方向不明"
         動作 = "繼續觀望"
+
         進場 = None
         止損 = None
         止盈1 = None
@@ -419,24 +758,43 @@ def 分析幣種(symbol, price, k15, k1h, k4h, state):
     下單 = None
 
     if 進場 is not None:
+
         下單 = 計算下單(
             方向,
             進場,
             止損
         )
 
-    if oi_change > 1:
-        oi_text = "持倉增加，可能有資金進入"
+    if oi is None:
+
+        oi_text = "OI資料暫時無法取得"
+
+    elif old is None:
+
+        oi_text = "首次紀錄，等待下次比較"
+
+    elif oi_change > 1:
+
+        oi_text = "持倉增加，可能有新倉進入"
+
     elif oi_change < -1:
-        oi_text = "持倉減少，可能有資金撤出"
+
+        oi_text = "持倉減少，可能有倉位退出"
+
     else:
+
         oi_text = "持倉變化不明顯"
 
     if book > 0.60:
+
         book_text = "買單較強"
+
     elif book < 0.40:
+
         book_text = "賣單較強"
+
     else:
+
         book_text = "買賣力量接近"
 
     return {
@@ -457,12 +815,9 @@ def 分析幣種(symbol, price, k15, k1h, k4h, state):
         "止盈1": 止盈1,
         "止盈2": 止盈2,
         "下單": 下單
-    }
-
-
-# ==================================
-# 8. 找出符合條件的低價幣
-# ==================================
+    } # ==========================================
+# 12. 掃描低價幣
+# ==========================================
 
 def 掃描幣種():
 
@@ -470,25 +825,45 @@ def 掃描幣種():
         "/openApi/swap/v2/quote/ticker"
     )
 
+    if not isinstance(data, list):
+        raise ValueError("Ticker資料格式錯誤")
+
     candidates = []
 
     for item in data:
 
-        symbol = item.get("symbol", "")
+        try:
 
-        if not symbol.endswith("-USDT"):
-            continue
+            symbol = item.get("symbol", "")
 
-        base = symbol.split("-")[0]
+            if not symbol.endswith("-USDT"):
+                continue
 
-        if base in 排除幣種:
-            continue
+            base = symbol.split("-")[0]
 
-        price = float(item.get("lastPrice", 0))
+            if base in 排除幣種:
+                continue
 
-        if 最低幣價 <= price <= 最高幣價:
+            price = float(
+                item.get("lastPrice", 0)
+            )
+
+            if not (
+                最低幣價 <= price <= 最高幣價
+            ):
+                continue
+
+            quote_volume = float(
+                item.get("quoteVolume", 0)
+            )
+
+            if quote_volume <= 0:
+                continue
 
             candidates.append(item)
+
+        except Exception:
+            continue
 
     candidates.sort(
         key=lambda x: float(
@@ -500,17 +875,20 @@ def 掃描幣種():
     return candidates[:每次掃描數量]
 
 
-# ==================================
-# 9. 傳送中文報告
-# ==================================
+# ==========================================
+# 13. Telegram報告
+# ==========================================
 
 def 傳送報告(results):
 
     if not results:
+
         傳送通知(
             "🔍 BingX AI小幣雷達\n\n"
+            f"🕒 {現在時間()}\n\n"
             "本次沒有取得有效分析資料。"
         )
+
         return
 
     results.sort(
@@ -520,58 +898,63 @@ def 傳送報告(results):
 
     message = (
         "🔍 BingX AI小幣雷達\n"
-        "🕒 " + 現在時間() + "\n"
-        "💰 帳戶本金：100 USDT\n"
-        "⚠️ 單筆風險上限：1 USDT\n"
+        f"🕒 {現在時間()}\n"
+        f"💰 帳戶本金：{本金} USDT\n"
+        f"⚠️ 單筆風險上限：{單筆風險} USDT\n"
         "━━━━━━━━━━━━━━\n"
     )
 
     for r in results[:8]:
 
         message += (
-            "\n🪙 幣種：" + r["symbol"] + "\n"
-            "💵 現價：" + str(round(r["price"], 6)) + "\n"
-            "📊 方向：" + r["方向"] + "\n"
-            "🎯 建議：" + r["動作"] + "\n"
-            "📈 分析分數：" + str(round(r["分數"], 1)) + "\n"
-            "📉 RSI：" + str(round(r["RSI"], 1)) + "\n"
-            "🟢 可能支撐：" + str(round(r["支撐"], 6)) + "\n"
-            "🔴 可能壓力：" + str(round(r["壓力"], 6)) + "\n"
-            "📦 成交量：" + str(round(r["成交倍數"], 2)) + "倍\n"
-            "🐋 持倉：" + r["持倉說明"] + "\n"
-            "📚 買賣掛單：" + r["掛單說明"] + "\n"
+            f"\n🪙 幣種：{r['symbol']}\n"
+            f"💵 現價：{r['price']:.6f}\n"
+            f"📊 方向：{r['方向']}\n"
+            f"🎯 建議：{r['動作']}\n"
+            f"📈 分析分數：{r['分數']:.1f}\n"
+            f"📉 RSI：{r['RSI']:.1f}\n"
+            f"🟢 可能支撐：{r['支撐']:.6f}\n"
+            f"🔴 可能壓力：{r['壓力']:.6f}\n"
+            f"📦 成交量：{r['成交倍數']:.2f}倍\n"
+            f"🐋 持倉：{r['持倉說明']}\n"
+            f"📚 買賣掛單：{r['掛單說明']}\n"
         )
 
-        if r["進場"] is not None and r["下單"]:
+        if (
+            r["進場"] is not None
+            and r["下單"] is not None
+        ):
 
             o = r["下單"]
 
             message += (
-                "\n📍 參考進場：" + str(round(r["進場"], 6)) + "\n"
-                "🛑 參考止損：" + str(round(r["止損"], 6)) + "\n"
-                "🎯 第一止盈：" + str(round(r["止盈1"], 6)) + "\n"
-                "🎯 第二止盈：" + str(round(r["止盈2"], 6)) + "\n"
-                "⚖️ 建議槓桿：" + str(o["槓桿"]) + "倍\n"
-                "💰 建議保證金：" + str(round(o["保證金"], 2)) + " USDT\n"
-                "📦 合約總金額：" + str(round(o["合約金額"], 2)) + " USDT\n"
-                "⚠️ 預估止損虧損：" + str(round(o["預估虧損"], 2)) + " USDT\n"
+                f"\n📍 參考進場：{r['進場']:.6f}\n"
+                f"🛑 參考止損：{r['止損']:.6f}\n"
+                f"🎯 第一止盈：{r['止盈1']:.6f}\n"
+                f"🎯 第二止盈：{r['止盈2']:.6f}\n"
+                f"⚖️ 建議槓桿：{o['槓桿']}倍\n"
+                f"💰 建議保證金：{o['保證金']:.2f} USDT\n"
+                f"📦 合約總金額：{o['合約金額']:.2f} USDT\n"
+                f"⚠️ 預估止損虧損：{o['預估虧損']:.2f} USDT\n"
             )
 
         message += "\n━━━━━━━━━━━━━━\n"
 
     message += (
         "\n📌 本程式只提供分析，不會自動下單。"
-        "\n📌 主力動向只是公開市場跡象，不代表能確認主力身分。"
-        "\n📌 以上價格是模型估算，不保證未來走勢。"
-        "\n📌 實際虧損可能因手續費、滑價及強平風險而超過估算。"
+        "\n📌 主力動向只是公開市場跡象，不能確認主力身分。"
+        "\n📌 OI變化以兩次成功紀錄作比較。"
+        "\n📌 價格與指標不保證未來走勢。"
+        "\n📌 未計入手續費、滑價及資金費率。"
+        "\n📌 實際虧損可能超過預估值。"
     )
 
     傳送通知(message)
 
 
-# ==================================
-# 10. 執行一次掃描
-# ==================================
+# ==========================================
+# 14. 執行一次掃描
+# ==========================================
 
 def main():
 
@@ -579,29 +962,67 @@ def main():
 
     state = 讀取紀錄()
 
-    candidates = 掃描幣種()
+    try:
+
+        candidates = 掃描幣種()
+
+    except Exception as e:
+
+        logging.error(
+            "掃描幣種失敗：%s",
+            str(e)
+        )
+
+        傳送通知(
+            "⚠️ BingX掃描失敗\n"
+            f"時間：{現在時間()}\n"
+            f"錯誤：{str(e)[:500]}"
+        )
+
+        return
 
     results = []
 
     for item in candidates:
 
         symbol = item["symbol"]
-        price = float(item["lastPrice"])
 
         try:
 
+            price = float(
+                item["lastPrice"]
+            )
+
             print("分析中：", symbol)
 
-            k15 = 取得K線(symbol, "15m")
-            time.sleep(1.1)
+            k15 = 取得K線(
+                symbol,
+                "15m"
+            )
 
-            k1h = 取得K線(symbol, "1h")
-            time.sleep(1.1)
+            time.sleep(請求間隔)
 
-            k4h = 取得K線(symbol, "4h")
-            time.sleep(1.1)
+            k1h = 取得K線(
+                symbol,
+                "1h"
+            )
+
+            time.sleep(請求間隔)
+
+            k4h = 取得K線(
+                symbol,
+                "4h"
+            )
+
+            time.sleep(請求間隔)
 
             if not k15 or not k1h or not k4h:
+
+                logging.warning(
+                    "%s K線資料不足，跳過",
+                    symbol
+                )
+
                 continue
 
             result = 分析幣種(
@@ -617,16 +1038,89 @@ def main():
 
         except Exception as e:
 
-            print("幣種分析失敗：", symbol, str(e))
+            logging.exception(
+                "幣種分析失敗：%s",
+                symbol
+            )
 
-        time.sleep(1.1)
+        time.sleep(請求間隔)
 
-    儲存紀錄(state)
+    try:
+
+        儲存紀錄(state)
+
+    except Exception as e:
+
+        logging.error(
+            "紀錄儲存失敗：%s",
+            str(e)
+        )
 
     傳送報告(results)
 
     print("掃描完成：", 現在時間())
 
 
+# ==========================================
+# 15. 每15分鐘自動循環
+# ==========================================
+
+def 啟動():
+
+    print("================================")
+    print("BingX AI小幣雷達啟動")
+    print("本金：", 本金, "USDT")
+    print("單筆風險：", 單筆風險, "USDT")
+    print("掃描數量：", 每次掃描數量)
+    print("掃描間隔：", 掃描間隔, "秒")
+    print("================================")
+
+    while True:
+
+        開始時間 = time.time()
+
+        try:
+
+            main()
+
+        except KeyboardInterrupt:
+
+            print("使用者停止程式")
+            break
+
+        except Exception as e:
+
+            logging.exception(
+                "主程式發生錯誤：%s",
+                str(e)
+            )
+
+        執行時間 = time.time() - 開始時間
+
+        等待時間 = max(
+            5,
+            掃描間隔 - 執行時間
+        )
+
+        print(
+            f"下次掃描約在 {等待時間:.0f} 秒後"
+        )
+
+        try:
+
+            time.sleep(等待時間)
+
+        except KeyboardInterrupt:
+
+            print("程式已停止")
+            break
+
+
+# ==========================================
+# 16. 程式入口
+# ==========================================
+
 if __name__ == "__main__":
-    main()
+
+    啟動()
+
