@@ -1064,34 +1064,22 @@ print("實際取得幣種：", [
 
             results.append(result)
 
-        except Exception as e:
+                except Exception as e:
 
-    import traceback
+            import traceback
 
-    print("幣種分析失敗：", symbol)
-    print("錯誤類型：", type(e).__name__)
-    print("錯誤內容：", repr(e))
+            print("幣種分析失敗：", symbol)
+            print("錯誤類型：", type(e).__name__)
+            print("錯誤內容：", repr(e))
 
-    traceback.print_exc()
+            traceback.print_exc()
 
-    print("=" * 60)
-
-    print(
-        "錯誤類型：",
-        type(e).__name__
-    )
-
-    print(
-        "錯誤內容：",
-        repr(e)
-    )
-
-    traceback.print_exc()
-
-    print("=" * 60)
-    print("\n")
+            print("=" * 60)
 
         time.sleep(請求間隔)
+    print("=" * 60)
+
+)
 
     try:
 
