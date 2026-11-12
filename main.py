@@ -145,18 +145,65 @@ def 取得K線(symbol, interval):
     if not data or len(data) < 30:
         return None
 
-    return {
-        "open": [float(x[1]) for x in data],
-        "high": [float(x[2]) for x in data],
-        "low": [float(x[3]) for x in data],
-        "close": [float(x[4]) for x in data],
-        "volume": [float(x[5]) for x in data],
-        "buy": [
-            float(x[9]) if len(x) > 9 else float(x[5]) / 2
-            for x in data
-        ]
-    }
+    try:
+        opens = []
+        highs = []
+        lows = []
+        closes = []
+        volumes = []
+        buys = []
 
+        for x in data:
+
+            if isinstance(x, dict):
+                o = float(x["open"])
+                h = float(x["high"])
+                l = float(x["low"])
+                c = float(x["close"])
+                v = float(x["volume"])
+
+                # 沒有主動買入量時，使用成交量一半作為中性估值
+                b = float(
+                    x.get("takerBuyBaseVolume", v / 2)
+                )
+
+            else:
+                o = float(x[1])
+                h = float(x[2])
+                l = float(x[3])
+                c = float(x[4])
+                v = float(x[5])
+
+                b = (
+                    float(x[9])
+                    if len(x) > 9
+                    else v / 2
+                )
+
+            opens.append(o)
+            highs.append(h)
+            lows.append(l)
+            closes.append(c)
+            volumes.append(v)
+            buys.append(b)
+
+        return {
+            "open": opens,
+            "high": highs,
+            "low": lows,
+            "close": closes,
+            "volume": volumes,
+            "buy": buys
+        }
+
+    except Exception as e:
+        print(
+            "K線資料格式錯誤：",
+            symbol,
+            interval,
+            repr(e)
+        )
+        raise
 
 def 分析K線(k):
     close = k["close"]
