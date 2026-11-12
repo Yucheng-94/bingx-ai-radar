@@ -2,8 +2,12 @@ import os
 import time
 import json
 import logging
-import traceback
-import requests
+import math
+import tempfile
+from http.client import HTTPException
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 from datetime import datetime, timezone, timedelta
 
@@ -13,25 +17,9 @@ from datetime import datetime, timezone, timedelta
 # 穩定掃描版
 # ============================================================
 
-程式版本 = "3.0-STABLE"
-
-print("=" * 60)
-print("BingX AI 小幣雷達")
-print("版本：", 程式版本)
-
-if "__file__" in globals():
-    print("執行檔位置：", os.path.abspath(__file__))
-else:
-    print("執行環境：目前工作目錄")
-    print("工作目錄：", os.getcwd())
-
-print("目前時間：", datetime.now())
-print("=" * 60)
+程式版本 = "3.1"
 
 
-# ============================================================
-# 1. 基本設定
-# ============================================================
 
 本金 = 100.0
 
@@ -49,15 +37,14 @@ print("=" * 60)
 
 掃描間隔 = 900
 
-API_TIMEOUT = 20
+API_TIMEOUT = 10
 
-API_RETRY = 5
+API_RETRY = 3
 
 API_RETRY_BASE_SLEEP = 2.0
 
-API_MIN_INTERVAL = 0.35
+API_MIN_INTERVAL = 1.05
 
-報告最大幣種數 = 5
 
 
 # ============================================================
@@ -129,15 +116,6 @@ logging.basicConfig(
 # 7. HTTP Session
 # ============================================================
 
-session = requests.Session()
-
-session.headers.update({
-    "User-Agent": (
-        "BingX-AI-Market-Radar/"
-        + 程式版本
-    ),
-    "Accept": "application/json",
-})
 
 
 最後API請求時間 = 0.0
@@ -161,29 +139,17 @@ def 現在時間():
 # ============================================================
 
 def 轉Float(value, 預設=None):
-
-    try:
-
-        if value is None:
-            return 預設
-
-        if isinstance(value, str):
-
-            value = value.strip()
-
-            if not value:
-                return 預設
-
-        return float(value)
-
-    except Exception:
-
+    if isinstance(value, bool):
         return 預設
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 預設
+    return number if math.isfinite(number) else 預設
 
 
-# ============================================================
-# 10. API 限速
-# ============================================================
+class 行情暫缺(RuntimeError):
+    pass
 
 def API等待():
 
@@ -204,197 +170,66 @@ def API等待():
 # 11. API 請求
 # ============================================================
 
-def 取得資料(
-    path,
-    params=None
-):
-
+def 取得資料(path, params=None):
     global 最後API請求時間
-
-    url = 網址 + path
-
-    最後錯誤 = None
-
-    for attempt in range(
-        1,
-        API_RETRY + 1
-    ):
-
-        try:
-
-            API等待()
-
-            response = session.get(
-                url,
-                params=params or {},
-                timeout=API_TIMEOUT
-            )
-
-            最後API請求時間 = time.monotonic()
-
-            print(
-                f"API請求：{path} "
-                f"HTTP={response.status_code}"
-            )
-
-            if response.status_code == 429:
-
-                raise RuntimeError(
-                    "HTTP 429 API限頻"
-                )
-
-            if response.status_code >= 500:
-
-                raise RuntimeError(
-                    f"HTTP {response.status_code}"
-                )
-
-            response.raise_for_status()
-
-            try:
-
-                result = response.json()
-
-            except Exception as e:
-
-                raise ValueError(
-                    "API回傳不是有效JSON"
-                ) from e
-
-            if not isinstance(
-                result,
-                dict
-            ):
-
-                raise ValueError(
-                    "API回傳格式不是dict"
-                )
-
-            code = result.get(
-                "code"
-            )
-
-            msg = result.get(
-                "msg",
-                ""
-            )
-
-            if code is not None:
-
-                if str(code) != "0":
-
-                    raise RuntimeError(
-                        f"BingX API錯誤 "
-                        f"code={code} "
-                        f"msg={msg}"
-                    )
-
-            if "data" not in result:
-
-                raise ValueError(
-                    f"API缺少data：{result}"
-                )
-
-            return result["data"]
-
-        except Exception as e:
-
-            最後錯誤 = e
-
-            print(
-                f"API失敗 "
-                f"{attempt}/{API_RETRY}："
-                f"{type(e).__name__}: {e}"
-            )
-
-            if attempt < API_RETRY:
-
-                sleep_time = (
-                    API_RETRY_BASE_SLEEP
-                    * attempt
-                )
-
-                time.sleep(
-                    sleep_time
-                )
-
-    raise RuntimeError(
-        f"API最終失敗：{path}："
-        f"{最後錯誤}"
+    query = "?" + urlencode(params) if params else ""
+    request = Request(
+        網址 + path + query,
+        headers={"Accept": "application/json", "User-Agent": "BingX-Market-Radar/3.1"},
     )
-
-
-# ============================================================
-# 12. Telegram
-# ============================================================
+    for attempt in range(1, API_RETRY + 1):
+        delay = API_RETRY_BASE_SLEEP * 2 ** (attempt - 1)
+        API等待()
+        最後API請求時間 = time.monotonic()
+        try:
+            with urlopen(request, timeout=API_TIMEOUT) as response:
+                result = json.load(response)
+            if not isinstance(result, dict):
+                raise ValueError("回應格式異常")
+            code = str(result.get("code"))
+            if code != "0":
+                raise ValueError(f"BingX {code} {str(result.get('msg', ''))[:160]}")
+            if result.get("data") is None:
+                raise ValueError("回應缺少行情資料")
+            return result["data"]
+        except HTTPError as exc:
+            detail = f"HTTP {exc.code}"
+            retry_after = 轉Float(exc.headers.get("Retry-After"), 0)
+            exc.close()
+            if exc.code not in {408, 429} and exc.code < 500:
+                raise 行情暫缺(f"{path} {detail}") from exc
+            if retry_after > 60:
+                raise 行情暫缺(f"{path} {detail}，服務要求稍後再試") from exc
+            delay = max(delay, retry_after)
+        except (URLError, OSError, ValueError, HTTPException) as exc:
+            detail = str(exc)[:200]
+        if attempt < API_RETRY:
+            time.sleep(delay)
+    raise 行情暫缺(f"{path} {detail}")
 
 def 傳送通知(message):
-
+    print(message)
     if not TG_TOKEN or not TG_CHAT:
-
-        print("=" * 60)
-        print("Telegram尚未設定")
-        print(message)
-        print("=" * 60)
-
         return False
 
-    url = (
-        "https://api.telegram.org/"
-        f"bot{TG_TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    request = Request(
+        url,
+        data=json.dumps({"chat_id": TG_CHAT, "text": message}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
     )
-
-    最大長度 = 3500
-
-    chunks = [
-        message[i:i + 最大長度]
-        for i in range(
-            0,
-            len(message),
-            最大長度
-        )
-    ]
-
-    成功 = True
-
-    for chunk in chunks:
-
-        try:
-
-            response = session.post(
-                url,
-                json={
-                    "chat_id": TG_CHAT,
-                    "text": chunk
-                },
-                timeout=20
-            )
-
-            response.raise_for_status()
-
-            result = response.json()
-
-            if not result.get("ok"):
-
-                raise RuntimeError(
-                    str(result)
-                )
-
-        except Exception as e:
-
-            成功 = False
-
-            logging.error(
-                "Telegram傳送失敗：%s",
-                str(e)
-            )
-
-    return 成功
-
-
-# ============================================================
-# 13. State
-# ============================================================
+    try:
+        with urlopen(request, timeout=API_TIMEOUT) as response:
+            result = json.load(response)
+        if isinstance(result, dict) and result.get("ok") is True:
+            return True
+        logging.warning("Telegram 未確認送達，報告已輸出至執行記錄")
+    except HTTPError as exc:
+        logging.warning("Telegram HTTP %s，報告已輸出至執行記錄", exc.code)
+        exc.close()
+    except (URLError, OSError, ValueError, HTTPException) as exc:
+        logging.warning("Telegram 未確認送達（%s），報告已輸出至執行記錄", type(exc).__name__)
+    return False
 
 def 讀取紀錄():
 
@@ -442,53 +277,23 @@ def 讀取紀錄():
 # ============================================================
 
 def 儲存紀錄(data):
-
-    temp_file = (
-        紀錄檔 + ".tmp"
-    )
-
+    destination = os.path.abspath(紀錄檔)
+    temporary = None
     try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=os.path.dirname(destination),
+            prefix=".radar-state-", delete=False,
+        ) as file:
+            temporary = file.name
+            json.dump(data, file, ensure_ascii=False, indent=2)
+        os.replace(temporary, destination)
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
 
-        with open(
-            temp_file,
-            "w",
-            encoding="utf-8"
-        ) as f:
-
-            json.dump(
-                data,
-                f,
-                ensure_ascii=False,
-                indent=2
-            )
-
-        os.replace(
-            temp_file,
-            紀錄檔
-        )
-
-    except Exception:
-
-        try:
-
-            if os.path.exists(
-                temp_file
-            ):
-
-                os.remove(
-                    temp_file
-                )
-
-        except Exception:
-
-            pass
-
-        raise
-
-
-# ============================================================
-# 15. EMA
-# ============================================================
 
 def 計算EMA(
     values,
@@ -757,7 +562,7 @@ def 解析K線(data):
 
                 continue
 
-            if h < l:
+            if h < l or buy > v:
 
                 continue
 
@@ -774,6 +579,9 @@ def 解析K線(data):
                     0
                 )
             )
+
+            if timestamp_value <= 0:
+                continue
 
             rows.append({
                 "time": timestamp_value,
@@ -880,7 +688,10 @@ def 取得K線(
             or []
         )
 
-    return 解析K線(data) # ============================================================
+    return 解析K線(data)
+
+
+# ============================================================
 # 19. K線技術分析
 # ============================================================
 
@@ -979,12 +790,6 @@ def 分析K線(k):
         / 14
     )
 
-    if atr <= 0:
-
-        raise ValueError(
-            "ATR無效"
-        )
-
     # --------------------------------------------------------
     # 支撐壓力
     # --------------------------------------------------------
@@ -1030,7 +835,7 @@ def 分析K線(k):
 
         分數 += 1
 
-    else:
+    elif ema7[-1] < ema25[-1]:
 
         分數 -= 1
 
@@ -1038,7 +843,7 @@ def 分析K線(k):
 
         分數 += 1
 
-    else:
+    elif close[-1] < ema7[-1]:
 
         分數 -= 1
 
@@ -1304,9 +1109,8 @@ def 取得買賣掛單(symbol):
         買單 + 賣單
     )
 
-    if total <= 0:
-
-        return 0.5
+    if not math.isfinite(total) or total <= 0 or not bids or not asks:
+        raise ValueError("掛單深度不足")
 
     return (
         買單 / total
@@ -1317,355 +1121,58 @@ def 取得買賣掛單(symbol):
 # 22. 合約清單
 # ============================================================
 
-def 取得合約清單():
-
-    data = 取得資料(
-        "/openApi/swap/v2/quote/contracts"
-    )
-
-    if isinstance(
-        data,
-        dict
-    ):
-
-        data = (
-            data.get("data")
-            or data.get("list")
-            or []
-        )
-
-    if not isinstance(
-        data,
-        list
-    ):
-
-        raise ValueError(
-            "合約清單格式錯誤"
-        )
-
-    contracts = {}
-
-    for item in data:
-
-        if not isinstance(
-            item,
-            dict
-        ):
-
-            continue
-
-        symbol = str(
-            item.get(
-                "symbol",
-                ""
-            )
-        ).upper()
-
-        if not symbol:
-
-            continue
-
-        # ----------------------------------------------------
-        # 只保留USDT合約
-        # ----------------------------------------------------
-
-        if not symbol.endswith(
-            "-USDT"
-        ):
-
-            continue
-
-        base = (
-            symbol.split("-")[0]
-        )
-
-        if base in 排除幣種:
-
-            continue
-
-        # ----------------------------------------------------
-        # 優先判斷合約狀態
-        # ----------------------------------------------------
-
-        status = str(
-            item.get(
-                "status",
-                ""
-            )
-        ).lower()
-
-        if status:
-
-            if status not in {
-                "1",
-                "online",
-                "normal",
-                "trading",
-                "open",
-            }:
-
-                # 某些版本可能使用其他正常值
-                if status not in {
-                    "2"
-                }:
-
-                    continue
-
-        # ----------------------------------------------------
-        # 排除非永續 / 異常合約
-        # ----------------------------------------------------
-
-        contract_type = str(
-            item.get(
-                "contractType",
-                item.get(
-                    "contract_type",
-                    ""
-                )
-            )
-        ).lower()
-
-        if contract_type:
-
-            if (
-                "perpetual"
-                not in contract_type
-                and "永續"
-                not in contract_type
-            ):
-
-                continue
-
-        contracts[symbol] = item
-
-    return contracts
-
-
-# ============================================================
-# 23. Ticker
-# ============================================================
-
-def 取得Ticker():
-
-    data = 取得資料(
-        "/openApi/swap/v2/quote/ticker"
-    )
-
-    if isinstance(
-        data,
-        dict
-    ):
-
-        data = (
-            data.get("data")
-            or data.get("list")
-            or []
-        )
-
-    if not isinstance(
-        data,
-        list
-    ):
-
-        raise ValueError(
-            "Ticker資料格式錯誤"
-        )
-
+def 行情清單(data, label):
+    if isinstance(data, dict):
+        data = data.get("data", data.get("list"))
+    if not isinstance(data, list) or not any(isinstance(item, dict) for item in data):
+        raise 行情暫缺(f"{label}暫無可用資料")
     return data
 
 
-# ============================================================
-# 24. 掃描低價幣
-# ============================================================
+def 取得合約清單():
+    data = 行情清單(取得資料("/openApi/swap/v2/quote/contracts"), "合約清單")
+    contracts = {}
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        symbol = str(item.get("symbol", "")).strip().upper()
+        if not symbol.endswith("-USDT") or symbol[:-5] in 排除幣種:
+            continue
+        if str(item.get("status", "")).lower() not in {"1", "online", "normal", "trading", "open"}:
+            continue
+        if str(item.get("apiStateOpen", "")).lower() in {"false", "0"}:
+            continue
+        contracts[symbol] = item
+    return contracts
+
+
+def 取得Ticker():
+    return 行情清單(取得資料("/openApi/swap/v2/quote/ticker"), "24 小時行情")
+
 
 def 掃描幣種():
-
-    # --------------------------------------------------------
-    # 先取得合約清單
-    # --------------------------------------------------------
-
-    try:
-
-        contracts = (
-            取得合約清單()
-        )
-
-    except Exception as e:
-
-        logging.warning(
-            "取得合約清單失敗：%s",
-            str(e)
-        )
-
-        contracts = {}
-
-    # --------------------------------------------------------
-    # 再取得Ticker
-    # --------------------------------------------------------
-
-    ticker = 取得Ticker()
-
-    candidates = []
-
-    已加入 = set()
-
-    for item in ticker:
-
-        try:
-
-            if not isinstance(
-                item,
-                dict
-            ):
-
-                continue
-
-            symbol = str(
-                item.get(
-                    "symbol",
-                    ""
-                )
-            ).upper().strip()
-
-            if not symbol:
-
-                continue
-
-            if not symbol.endswith(
-                "-USDT"
-            ):
-
-                continue
-
-            if symbol in 已加入:
-
-                continue
-
-            base = (
-                symbol.split("-")[0]
-            )
-
-            if base in 排除幣種:
-
-                continue
-
-            # ------------------------------------------------
-            # 如果成功取得合約清單
-            # 則必須存在於合約清單
-            # ------------------------------------------------
-
-            if contracts:
-
-                if symbol not in contracts:
-
-                    continue
-
-            price = 轉Float(
-                item.get(
-                    "lastPrice"
-                )
-            )
-
-            if price is None:
-
-                continue
-
-            if not (
-                最低幣價
-                <= price
-                <= 最高幣價
-            ):
-
-                continue
-
-            quote_volume = 轉Float(
-                item.get(
-                    "quoteVolume",
-                    item.get(
-                        "volume24h",
-                        0
-                    )
-                ),
-                0
-            )
-
-            if (
-                quote_volume is None
-                or quote_volume <= 0
-            ):
-
-                continue
-
-            已加入.add(
-                symbol
-            )
-
-            candidates.append({
-                "symbol": symbol,
-                "lastPrice": price,
-                "quoteVolume": quote_volume,
-            })
-
-        except Exception as e:
-
-            logging.debug(
-                "Ticker項目跳過：%s",
-                str(e)
-            )
-
+    contracts = 取得合約清單()
+    candidates = {}
+    for item in 取得Ticker():
+        if not isinstance(item, dict):
             continue
-
-    # --------------------------------------------------------
-    # 依24h成交額排序
-    # --------------------------------------------------------
-
-    candidates.sort(
-        key=lambda x: (
-            x["quoteVolume"]
-        ),
-        reverse=True
-    )
-
-    # --------------------------------------------------------
-    # 最終只取設定數量
-    # --------------------------------------------------------
-
-    candidates = candidates[
-        :每次掃描數量
-    ]
-
-    # --------------------------------------------------------
-    # 最後再做一次symbol去重
-    # --------------------------------------------------------
-
-    final = []
-
-    seen = set()
-
-    for item in candidates:
-
-        symbol = item[
-            "symbol"
-        ]
-
-        if symbol in seen:
-
+        symbol = str(item.get("symbol", "")).strip().upper()
+        if symbol not in contracts:
             continue
-
-        seen.add(
-            symbol
-        )
-
-        final.append(
-            item
-        )
-
-    return final
-
-
-# ============================================================
-# 25. 風險管理
-# ============================================================
+        price = 轉Float(item.get("lastPrice"))
+        volume = 轉Float(item.get("quoteVolume"))
+        if price is None or not 最低幣價 <= price <= 最高幣價:
+            continue
+        if volume is None or volume <= 0:
+            continue
+        close_time = 轉Float(item.get("closeTime"), 0)
+        candidate = dict(symbol=symbol, lastPrice=price, quoteVolume=volume)
+        previous = candidates.get(symbol)
+        if previous is None or (close_time, volume) > (previous[0], previous[1]["quoteVolume"]):
+            candidates[symbol] = (close_time, candidate)
+    ranked = sorted((entry[1] for entry in candidates.values()),
+                    key=lambda item: (-item["quoteVolume"], item["symbol"]))
+    return ranked[:每次掃描數量]
 
 def 計算下單(
     方向,
@@ -1795,10 +1302,10 @@ def 分析幣種(
             symbol
         )
 
-    except Exception as e:
+    except (行情暫缺, ValueError) as e:
 
-        logging.warning(
-            "%s OI取得失敗：%s",
+        logging.info(
+            "%s 持倉資料暫缺：%s",
             symbol,
             str(e)
         )
@@ -1807,7 +1314,7 @@ def 分析幣種(
     # Order Book
     # --------------------------------------------------------
 
-    book = 0.5
+    book = None
 
     try:
 
@@ -1815,10 +1322,10 @@ def 分析幣種(
             symbol
         )
 
-    except Exception as e:
+    except (行情暫缺, ValueError) as e:
 
-        logging.warning(
-            "%s 深度取得失敗：%s",
+        logging.info(
+            "%s 掛單資料暫缺：%s",
             symbol,
             str(e)
         )
@@ -1885,7 +1392,7 @@ def 分析幣種(
     # OI + 深度
     # --------------------------------------------------------
 
-    if oi is not None:
+    if oi is not None and book is not None:
 
         if (
             oi_change > 1
@@ -2004,7 +1511,7 @@ def 分析幣種(
         elif 方向 == "偏向上漲":
 
             if not (
-                止損 < 進場
+                0 < 止損 < 進場
                 < 止盈1
                 < 止盈2
             ):
@@ -2019,7 +1526,7 @@ def 分析幣種(
             if not (
                 止損 > 進場
                 > 止盈1
-                > 止盈2
+                > 止盈2 > 0
             ):
 
                 進場 = None
@@ -2030,6 +1537,9 @@ def 分析幣種(
     # --------------------------------------------------------
     # 下單風險
     # --------------------------------------------------------
+
+    if 進場 is None:
+        動作 = "繼續觀望"
 
     下單 = None
 
@@ -2054,7 +1564,7 @@ def 分析幣種(
             "OI資料暫時無法取得"
         )
 
-    elif old is None:
+    elif old is None or old <= 0:
 
         oi_text = (
             "首次紀錄，等待下次比較"
@@ -2082,7 +1592,9 @@ def 分析幣種(
     # 深度說明
     # --------------------------------------------------------
 
-    if book > 0.60:
+    if book is None:
+        book_text = "掛單深度暫缺"
+    elif book > 0.60:
 
         book_text = (
             "買單較強"
@@ -2191,446 +1703,64 @@ def 格式化結果(r):
 # 28. Telegram報告
 # ============================================================
 
-def 傳送報告(results):
-
-    # --------------------------------------------------------
-    # 最終去重
-    # --------------------------------------------------------
-
-    unique = []
-
-    seen = set()
-
-    for r in results:
-
-        symbol = r.get(
-            "symbol"
-        )
-
-        if not symbol:
-
-            continue
-
-        if symbol in seen:
-
-            continue
-
-        seen.add(
-            symbol
-        )
-
-        unique.append(
-            r
-        )
-
-    # --------------------------------------------------------
-    # 最終限制數量
-    # --------------------------------------------------------
-
-    unique = unique[
-        :報告最大幣種數
-    ]
-
-    if not unique:
-
-        傳送通知(
-            "🔍 BingX AI小幣雷達\n\n"
-            f"🕒 {現在時間()}\n\n"
-            "本次沒有取得有效分析資料。"
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # 按絕對分數排序
-    # --------------------------------------------------------
-
-    unique.sort(
-        key=lambda x: (
-            abs(
-                x["分數"]
-            )
-        ),
-        reverse=True
-    )
-
-    # --------------------------------------------------------
-    # 報告標題
-    # --------------------------------------------------------
-
+def 傳送報告(results, scanned, unavailable):
+    ranked = sorted(results, key=lambda result: -abs(result["分數"]))
     message = (
         "🔍 BingX AI小幣雷達\n"
-        f"🕒 {現在時間()}\n"
-        f"💰 帳戶本金：{本金:.2f} USDT\n"
-        f"⚠️ 單筆風險上限："
-        f"{單筆風險:.2f} USDT\n"
-        f"🔎 本次掃描："
-        f"{len(unique)} / "
-        f"{每次掃描數量}\n"
-        "━━━━━━━━━━━━━━\n"
+        f"🕒 {現在時間()}（台灣時間）\n"
+        f"💰 本金 {本金:.2f} USDT｜單筆風險 {單筆風險:.2f} USDT\n"
+        f"🔎 掃描 {scanned}/{每次掃描數量} 檔｜有效分析 {len(ranked)} 檔\n"
     )
-
-    # --------------------------------------------------------
-    # 每個結果
-    # --------------------------------------------------------
-
-    for r in unique:
-
-        message += 格式化結果(
-            r
-        )
-
-        message += (
-            "\n━━━━━━━━━━━━━━\n"
-        )
-
-    # --------------------------------------------------------
-    # 固定說明
-    # --------------------------------------------------------
-
-    message += (
-        "\n📌 本程式只提供分析，不會自動下單。\n"
-        "📌 OI為公開市場資料，不代表可確認主力身分。\n"
-        "📌 OI變化以不同掃描週期的成功紀錄比較。\n"
-        "📌 價格與技術指標不保證未來走勢。\n"
-        "📌 未計入手續費、滑價及資金費率。\n"
-        "📌 實際虧損可能高於理論計算值。"
-    )
-
-    傳送通知(
-        message
-    )
+    for result in ranked:
+        message += "━━━━━━━━━━━━━━\n" + 格式化結果(result)
+    if unavailable:
+        message += "\n行情暫缺：" + "、".join(unavailable) + "\n"
+    if not scanned:
+        message += "\n本輪沒有符合價格與成交額條件的合約。\n"
+    if ranked:
+        message += "\n📌 只提供分析。估算未計入手續費、滑價與資金費率。"
+    傳送通知(message)
 
 
-# ============================================================
-# 29. 分析單一幣種
-# ============================================================
+def 分析單一幣種(item, state):
+    symbol = item["symbol"]
+    candles = []
+    for interval in ("15m", "1h", "4h"):
+        try:
+            data = 取得K線(symbol, interval)
+        except 行情暫缺 as exc:
+            raise 行情暫缺(f"{interval} K 線暫缺：{exc}") from exc
+        if data is None:
+            raise 行情暫缺(f"{interval} 有效 K 線不足 30 根")
+        candles.append(data)
+    return 分析幣種(symbol, item["lastPrice"], *candles, state)
 
-def 分析單一幣種(
-    item,
-    state
-):
-
-    symbol = item[
-        "symbol"
-    ]
-
-    price = float(
-        item["lastPrice"]
-    )
-
-    print(
-        "=" * 60
-    )
-
-    print(
-        "分析中：",
-        symbol
-    )
-
-    print(
-        "現價：",
-        price
-    )
-
-    # --------------------------------------------------------
-    # 15分鐘
-    # --------------------------------------------------------
-
-    k15 = 取得K線(
-        symbol,
-        "15m"
-    )
-
-    if not k15:
-
-        raise ValueError(
-            "15m K線無效"
-        )
-
-    time.sleep(
-        API_MIN_INTERVAL
-    )
-
-    # --------------------------------------------------------
-    # 1小時
-    # --------------------------------------------------------
-
-    k1h = 取得K線(
-        symbol,
-        "1h"
-    )
-
-    if not k1h:
-
-        raise ValueError(
-            "1h K線無效"
-        )
-
-    time.sleep(
-        API_MIN_INTERVAL
-    )
-
-    # --------------------------------------------------------
-    # 4小時
-    # --------------------------------------------------------
-
-    k4h = 取得K線(
-        symbol,
-        "4h"
-    )
-
-    if not k4h:
-
-        raise ValueError(
-            "4h K線無效"
-        )
-
-    time.sleep(
-        API_MIN_INTERVAL
-    )
-
-    # --------------------------------------------------------
-    # 綜合分析
-    # --------------------------------------------------------
-
-    result = 分析幣種(
-        symbol,
-        price,
-        k15,
-        k1h,
-        k4h,
-        state
-    )
-
-    return result
-
-
-# ============================================================
-# 30. 執行一次掃描
-# ============================================================
 
 def main():
-
-    print("=" * 60)
-
-    print(
-        "開始掃描：",
-        現在時間()
-    )
-
+    logging.info("開始掃描 %s", 現在時間())
     state = 讀取紀錄()
-
-    # --------------------------------------------------------
-    # 取得候選幣
-    # --------------------------------------------------------
-
     try:
-
         candidates = 掃描幣種()
-
-    except Exception as e:
-
-        logging.error(
-            "掃描幣種失敗：%s",
-            str(e)
-        )
-
-        傳送通知(
-            "⚠️ BingX掃描失敗\n"
-            f"時間：{現在時間()}\n"
-            f"錯誤：{str(e)[:800]}"
-        )
-
+    except 行情暫缺 as exc:
+        logging.warning("本輪行情暫缺：%s", exc)
+        傳送通知(f"🔍 BingX AI小幣雷達\n{現在時間()}\n行情暫缺，本輪未產生分析。")
         return
-
-    # --------------------------------------------------------
-    # 強制確認數量
-    # --------------------------------------------------------
-
-    candidates = candidates[
-        :每次掃描數量
-    ]
-
-    print(
-        "實際取得幣種數量：",
-        len(candidates)
-    )
-
-    print(
-        "實際取得幣種：",
-        [
-            x["symbol"]
-            for x in candidates
-        ]
-    )
-
-    if not candidates:
-
-        print(
-            "本次沒有符合條件的幣種"
-        )
-
-        傳送通知(
-            "🔍 BingX AI小幣雷達\n\n"
-            f"🕒 {現在時間()}\n\n"
-            "本次沒有符合低價與成交量條件的USDT永續合約。"
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # 分析
-    # --------------------------------------------------------
 
     results = []
-
-    已分析 = set()
-
+    unavailable = []
     for item in candidates:
-
-        symbol = item[
-            "symbol"
-        ]
-
-        if symbol in 已分析:
-
-            continue
-
-        已分析.add(
-            symbol
-        )
-
+        symbol = item["symbol"]
         try:
-
-            result = 分析單一幣種(
-                item,
-                state
-            )
-
-            if result:
-
-                results.append(
-                    result
-                )
-
-        except Exception as e:
-
-            print(
-                "幣種分析失敗：",
-                symbol
-            )
-
-            print(
-                "錯誤類型：",
-                type(e).__name__
-            )
-
-            print(
-                "錯誤內容：",
-                repr(e)
-            )
-
-            traceback.print_exc()
-
-            print(
-                "=" * 60
-            )
-
-        time.sleep(
-            API_MIN_INTERVAL
-        )
-
-    # --------------------------------------------------------
-    # 儲存OI狀態
-    # --------------------------------------------------------
-
-    try:
-
-        儲存紀錄(
-            state
-        )
-
-    except Exception as e:
-
-        logging.error(
-            "紀錄儲存失敗：%s",
-            str(e)
-        )
-
-    # --------------------------------------------------------
-    # 最終結果去重
-    # --------------------------------------------------------
-
-    final_results = []
-
-    seen = set()
-
-    for result in results:
-
-        symbol = result.get(
-            "symbol"
-        )
-
-        if not symbol:
-
-            continue
-
-        if symbol in seen:
-
-            continue
-
-        seen.add(
-            symbol
-        )
-
-        final_results.append(
-            result
-        )
-
-    # --------------------------------------------------------
-    # 最終限制
-    # --------------------------------------------------------
-
-    final_results = final_results[
-        :每次掃描數量
-    ]
-
-    print(
-        "=" * 60
-    )
-
-    print(
-        "分析成功數量：",
-        len(final_results)
-    )
-
-    print(
-        "分析結果：",
-        [
-            x["symbol"]
-            for x in final_results
-        ]
-    )
-
-    # --------------------------------------------------------
-    # 傳送報告
-    # --------------------------------------------------------
-
-    傳送報告(
-        final_results
-    )
-
-    print(
-        "掃描完成：",
-        現在時間()
-    )
-
-    print(
-        "=" * 60
-    ) # ============================================================
-# 31. 啟動循環
-# ============================================================
+            results.append(分析單一幣種(item, state))
+        except 行情暫缺 as exc:
+            logging.info("%s %s", symbol, exc)
+            unavailable.append(symbol)
+    if results:
+        try:
+            儲存紀錄(state)
+        except OSError as exc:
+            logging.warning("本輪持倉紀錄未能寫入：%s", exc)
+    傳送報告(results, len(candidates), unavailable)
 
 def 啟動():
 
@@ -2711,7 +1841,7 @@ def 啟動():
 
     while True:
 
-        開始時間 = time.time()
+        開始時間 = time.monotonic()
 
         try:
 
@@ -2748,7 +1878,7 @@ def 啟動():
                 pass
 
         執行時間 = (
-            time.time()
+            time.monotonic()
             - 開始時間
         )
 
@@ -2789,5 +1919,11 @@ def 啟動():
 
 if __name__ == "__main__":
 
-    啟動()
+    import argparse
 
+    parser = argparse.ArgumentParser(description="BingX AI 小幣雷達")
+    parser.add_argument("--once", action="store_true", help="只執行一輪掃描")
+    if parser.parse_args().once:
+        main()
+    else:
+        啟動()
