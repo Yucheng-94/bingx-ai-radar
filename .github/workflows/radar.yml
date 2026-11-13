@@ -31,7 +31,7 @@ jobs:
       - name: 檢查程式語法
         run: python -m py_compile main.py
 
-            - name: 讀取上一輪行情
+      - name: 讀取上一輪行情
         uses: actions/cache/restore@v4
         with:
           path: state.json
